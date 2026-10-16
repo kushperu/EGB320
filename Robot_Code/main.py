@@ -404,13 +404,18 @@ LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it l
 # floor and the camera cannot range it by ground geometry -- driving at it as if it were
 # the token would drive into the wall. But it does say a victim is near. So when the
 # marker is confirmed and no victim object is in view, nav places a victim in the cell IN
-# FRONT of the marker (wall range from the front sonar, minus half a cell), lights the
-# green LED and goes there to look (SEEK). The usual sonar check then decides whether
-# there is really something to close in on. A victim OBJECT on the floor always wins.
+# FRONT of the marker (wall range from the front sonar, minus half a cell and a small
+# back-off, so it lands BEFORE the wall and never on it), lights the green LED and goes
+# there to look (SEEK). The usual sonar check then decides whether there is really
+# something to close in on. A victim OBJECT on the floor always wins: if one is in view,
+# the victim is placed where the object is, not where the marker says.
 MARKER_CUE_ENABLED = True
 MARKER_CLASS_NAMES = (VICTIM_CLASS_NAME,)   # marker classes that mean "a victim is here":
                                             # the template folder under vision/templates/
-MARKER_CELL_INSET_M = CELL_M / 2.0          # wall -> centre of the cell in front of it
+MARKER_BACK_OFF_M = 0.05                    # extra nudge from the wall towards the robot, so a
+                                            # sonar reading that comes out long still lands in
+                                            # the cell BEFORE the wall, not in or past it
+MARKER_CELL_INSET_M = CELL_M / 2.0 + MARKER_BACK_OFF_M   # wall -> just inside the cell in front
 
 # --- the blind run-in ---------------------------------------------------------
 # Close up, the victim drops out of the bottom of the frame: at CAMERA_HEIGHT_M with
@@ -1950,7 +1955,7 @@ class Nav:
             marker = getattr(self.vision, "marker", None)
             self.marker_hits = self.marker_hits + 1 if marker is not None else 0
 
-        confirmed =self.hits >= DETECTION_DEBOUNCE and self._wanted(self.victim)
+        confirmed = self.hits >= DETECTION_DEBOUNCE and self._wanted(self.victim)
         lost = self.misses > LOST_GRACE_FRAMES
 
         if self.state == SEARCH:
@@ -2116,20 +2121,26 @@ class Nav:
 
     def _marker_cue(self):
         """The victim's wall marker is in view and there is no victim object to chase:
-        place a victim in the cell in front of the marker, light green and go and look
+        place a victim in the cell BEFORE the marker, light green and go and look
         there. True if it committed (state is now SEEK).
 
         The cell comes from the front sonar, which is only believed while the marker is
         near the nose (it then ranges the marker's own wall). From the turning centre the
-        wall is the sonar reading plus the sonar's offset; the cell in front of it is half
-        a cell back from there. SEEK then drives there, and the usual sonar check at the
+        wall is the sonar reading plus the sonar's offset; the victim goes MARKER_CELL_INSET_M
+        back from there (half a cell and a little more), so it lands in the cell in front of
+        the wall rather than on it. SEEK then drives there, and the usual sonar check at the
         last step decides whether anything is really standing in it.
+
+        A victim OBJECT in view always wins: while one is being confirmed this waits, and
+        the object's own spot becomes the placement (see _search and _seek).
         """
         marker = getattr(self.vision, "marker", None)
         if (not MARKER_CUE_ENABLED or marker is None or self.carrying
                 or self.marker_hits < DETECTION_DEBOUNCE
                 or abs(marker.bearing_deg) > US_TRUST_BEARING_DEG):
             return False
+        if self.hits > 0 and self._wanted(self.victim):
+            return False               # the object is in view: let it place the victim
         front = self.sonar.front
         if front is None:
             return False
@@ -2147,7 +2158,8 @@ class Nav:
         self.leds.yellow(False)
         self._announced = True
         STATUS.event(f"[nav] VICTIM MARKER seen (wall {to_wall*100:.0f}cm ahead) -- green LED "
-                     f"on, looking for the victim in cell {cell}")
+                     f"on, victim placed in cell {cell}, the cell before the marker "
+                     f"(robot is in {self.map.cell_at(o.x, o.y)})")
         self._enter(SEEK)
         return True
 
@@ -2434,8 +2446,14 @@ class Nav:
         self._set_leds()
         if self.misses == 0 and self.victim is not None:
             spot = self._victim_spot(self.victim)     # seen again: refine the cell
-            if spot is not None:
-                self.victim_cell = self.map.cell_at(*spot)
+            # After a marker cue only a victim still wanted may move the placement; the
+            # marker's guess is replaced by where the object really is.
+            if spot is not None and (self.marker_cell is None or self._wanted(self.victim)):
+                cell = self.map.cell_at(*spot)
+                if self.marker_cell is not None and cell != self.victim_cell:
+                    STATUS.event(f"[nav] victim OBJECT seen in {cell} -- using that instead of "
+                                 f"the marker's cell {self.victim_cell}")
+                self.victim_cell = cell
         self._grid(self._plan_victim)
 
     def _plan_victim(self):

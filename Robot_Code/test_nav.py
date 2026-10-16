@@ -1788,5 +1788,56 @@ check("the status line says when a marker is in view",
 check("...and says nothing when there isn't one",
       "marker" not in M.vision_summary(_types.SimpleNamespace(n_marker=0)))
 
+print("37b) the victim goes in the cell BEFORE the marker's wall -- not on it, not past it")
+# The geometry here is worked out from the maze, not from the code under test: the robot
+# sits at the centre of the base cell facing north and the marker's wall is the k-th cell
+# boundary ahead of it. The front sonar sits (CELL_M/2 - FRONT_WALL_AT_CENTRE_M) ahead of
+# the turning centre, so it reads the wall distance minus that. The victim must end up in
+# the cell just before the wall (k cells north of the base cell) even when the sonar reads
+# a few centimetres long or short.
+for k in range(0, 4):
+    bad = []
+    for err in (-0.05, 0.0, 0.05, 0.10, 0.15):
+        wall_from_centre = M.CELL_M / 2 + k * M.CELL_M
+        front = wall_from_centre - (M.CELL_M / 2 - M.FRONT_WALL_AT_CENTRE_M) + err
+        n, v = marker_nav(0.0, front)
+        run(n, M.DETECTION_DEBOUNCE + 1)
+        want = (M.BASE_CELL[0], M.BASE_CELL[1] - k)
+        if not (n.state == M.SEEK and n.victim_cell == want):
+            bad.append(f"sonar {err*100:+.0f}cm -> {n.victim_cell} (want {want})")
+    check(f"marker's wall {k} cell(s) ahead: victim in the cell before it, even if the sonar "
+          f"is off by -5..+15cm" + (f"  [{'; '.join(bad)}]" if bad else ""), not bad)
+
+print("37c) a victim OBJECT and the marker both in view: the object's cell is the placement")
+# The camera range for the object (0.40 m) puts it 2 cells ahead of the base cell; the
+# marker's wall (sonar 1.20 m) would put the victim 4 cells ahead. The object must win.
+obj_cell = (M.BASE_CELL[0], M.BASE_CELL[1] - 2)
+marker_only = marker_nav(0.0, 1.20)[0]
+run(marker_only, M.DETECTION_DEBOUNCE + 1)
+check("(setup) the marker alone would have put the victim somewhere else",
+      marker_only.victim_cell not in (None, obj_cell))
+
+n, v = marker_nav(0.0, 1.20, script=[V(dist=0.40)] * 8)
+run(n, M.DETECTION_DEBOUNCE + 1)
+check("both seen from the first frame -> victim placed where the object is",
+      n.state == M.SEEK and n.victim_cell == obj_cell and n.marker_cell is None)
+
+n, v = marker_nav(0.0, 1.20, script=[None, None] + [V(dist=0.40)] * 8)
+run(n, M.DETECTION_DEBOUNCE + 3)
+check("marker seen first, object a frame or two later -> the marker doesn't jump the gun",
+      n.state == M.SEEK and n.victim_cell == obj_cell and n.marker_cell is None)
+
+n, v = marker_nav(0.0, 1.20, script=[None] * 4)
+run(n, 4)
+first = n.victim_cell
+check("(setup) the marker cue fired first, with no object in view",
+      n.state == M.SEEK and n.marker_cell == first and first != obj_cell)
+v.script.extend([V(dist=0.40)] * 5)
+run(n, 3)
+check("then the object appears while seeking -> its cell replaces the marker's",
+      n.victim_cell == obj_cell)
+check("...and the marker's cell is still remembered, so it is ignored after the rescue",
+      n.marker_cell == first)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
