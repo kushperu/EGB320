@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import main as M
+import maze as MZ
 import motors as MOT
 
 # Most of this file exercises the legacy path: differential steering while driving and no
@@ -1991,6 +1992,270 @@ vv.system = _Sys([det("ramp", floor_y, 60, 0.0, 0.2)])
 vv.look()
 check("...and None when there is no obstacle in view", vv.obstacle is None)
 M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE = _s38_saved
+
+print("39) after collecting a victim: stand still, recheck the position against the walls")
+_s39_saved = (M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE, M.MOCK_COLLECTION, M.TEST_MODE)
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE = True, False, 0.0
+M.MOCK_COLLECTION, M.TEST_MODE = False, False        # the victim really is aboard, not in front
+
+
+class RecheckSonar(GapSonar):
+    """Sonars whose readings only count as 'fresh' once .ready is set (to test the wait)."""
+    def __init__(self, **kw):
+        super().__init__(**kw); self.ready = True
+    def since(self, name, t):
+        return (self.ready, self.get(name)) if name in self.sensors else (False, None)
+
+
+def recheck_nav(front, left=M.SIDE_WALL_AT_CENTRE_M, right=M.SIDE_WALL_AT_CENTRE_M,
+                theta=None, x=None, y=None, cell=(0, 3)):
+    """A Nav in `cell`, off the grid and facing north, whose odometry says (x, y)."""
+    s = RecheckSonar(left=left, right=right, front=front)
+    n = M.Nav(FakeDrive(ticks=(0, 0)), FakeVision([]), FakeLeds(), s)
+    cx, cy = n.map.centre(cell)
+    n.cell = cell
+    n.odo.reset(cx if x is None else x, cy if y is None else y,
+                M.HEADING_RAD[MZ.NORTH] if theta is None else theta)
+    return n, s, cx, cy
+
+
+# Cell (0,3): centre y = 0.98, its north wall at y = 1.12. A robot truly 4cm SOUTH of the
+# centre has the wall 0.18 m from its centre, so the front sonar (8cm ahead of it) reads 0.10.
+true_y, wall_y = 0.98 - 0.04, 1.12
+front_read = wall_y - (true_y + (M.CELL_M / 2 - M.FRONT_WALL_AT_CENTRE_M))
+n, s, cx, cy = recheck_nav(front=front_read, y=0.99)             # odometry is 5cm out
+n._fix_position({"front": front_read})
+check("wall ahead: the position along the corridor is pulled onto the truth (±1cm)",
+      abs(n.odo.y - true_y) < 0.01 and abs(n.odo.x - cx) < 1e-9)
+
+n, s, cx, cy = recheck_nav(front=0.06, y=0.98 + 0.05)           # at the centre; odometry 5cm long
+n._fix_position({"front": 0.06})
+check("a centred stop (front reads 6cm) puts it back on the centre", abs(n.odo.y - cy) < 0.01)
+
+n, s, cx, cy = recheck_nav(front=0.17, y=0.98)                  # fits no edge: ~11cm from the nearest
+n._fix_position({"front": 0.17})
+check("a front reading that matches no cell edge is ignored (a victim, the mechanism)",
+      abs(n.odo.y - 0.98) < 1e-9)
+
+n, s, cx, cy = recheck_nav(front=1.0, y=0.98)
+n._fix_position({"front": None})
+check("no echo ahead: nothing to check against, position untouched",
+      abs(n.odo.y - 0.98) < 1e-9 and abs(n.odo.x - cx) < 1e-9)
+
+# Sideways: truly 3cm right of centre -> left wall reads 3cm further, right wall 3cm nearer.
+n, s, cx, cy = recheck_nav(front=1.0)
+l, r = M.SIDE_WALL_AT_CENTRE_M + 0.03, M.SIDE_WALL_AT_CENTRE_M - 0.03
+n._fix_position({"front": None, "left": l, "right": r})
+check("side walls: the position across the corridor is pulled onto the truth (+3cm right)",
+      abs(n.odo.x - (cx + 0.03)) < 0.005 and abs(n.odo.y - cy) < 1e-9)
+n, s, cx, cy = recheck_nav(front=1.0, x=0.14 + 0.2)               # absurd odometry: 20cm over
+n._fix_position({"front": None, "left": l, "right": r})
+check("a side correction bigger than RECHECK_SIDE_MAX_M is not believed",
+      abs(n.odo.x - (n.map.centre((0, 3))[0] + 0.2)) < 1e-9)
+
+# Skewed heading: the sonars say nothing useful about position along the grid.
+n, s, cx, cy = recheck_nav(front=front_read, y=0.99, theta=M.HEADING_RAD[MZ.NORTH] + 0.5)
+n._fix_position({"front": front_read, "left": l, "right": r})
+check("pointing ~29 deg off a grid direction: left alone",
+      abs(n.odo.y - 0.99) < 1e-9 and abs(n.odo.x - cx) < 1e-9)
+
+# Facing east: the same maths in another direction. Cell (2,3): centre x = 0.70, east wall x = 0.84.
+# Truly 3cm WEST of the centre (x = 0.67); the odometry says 0.72.
+n, s, cx, cy = recheck_nav(front=1.0, cell=(2, 3), theta=M.HEADING_RAD[M.EAST], x=0.72)
+east_read = 0.84 - (0.67 + (M.CELL_M / 2 - M.FRONT_WALL_AT_CENTRE_M))
+n._fix_position({"front": east_read})
+check("facing EAST: along-track fix uses x, and lands on the truth",
+      abs(n.odo.x - 0.67) < 0.01 and abs(n.odo.y - cy) < 1e-9)
+# Facing west the wall is at x = 0.56 (the west edge of column 2); truly 3cm EAST (x = 0.73);
+# the odometry says 0.68.
+n, s, cx, cy = recheck_nav(front=1.0, cell=(2, 3), theta=M.HEADING_RAD[M.WEST], x=0.68)
+west_read = 0.73 - 0.56 - (M.CELL_M / 2 - M.FRONT_WALL_AT_CENTRE_M)
+n._fix_position({"front": west_read})
+check("facing WEST: the sign flips correctly (lands on the truth)",
+      abs(n.odo.x - 0.73) < 0.01 and abs(n.odo.y - cy) < 1e-9)
+
+# The mock collection leaves the victim in front of the sonar (10cm): that is not a wall.
+M.MOCK_COLLECTION = True
+n, s, cx, cy = recheck_nav(front=M.STOP_DISTANCE_M, y=0.98 + 0.02)
+n._fix_position({"front": M.STOP_DISTANCE_M})
+check("(mock collection) a front reading at the victim's stop distance is not used",
+      abs(n.odo.y - 1.00) < 1e-9)
+M.MOCK_COLLECTION = False
+
+# The whole sequence through step(): pickup -> no movement until fresh readings -> corrected -> rejoin.
+n, s, cx, cy = recheck_nav(front=front_read, y=0.99)
+s.ready = False
+n._enter(M.AT_VICTIM)
+n.rescue.started = time.monotonic() - 100.0                      # collection time is up
+n.step()
+check("pickup done -> RETURN, and a recheck is pending", n.state == M.RETURN and n.rechecking)
+d = n.drive
+run(n, 5)
+check("...no fresh readings yet: stands still, odometry untouched",
+      n.rechecking and d.last == (0.0, 0.0) and abs(n.odo.y - 0.99) < 1e-9)
+s.ready = True
+n.step()
+check("...fresh readings arrive: the position is rechecked (and corrected) before any move",
+      not n.rechecking and abs(n.odo.y - true_y) < 0.01)
+n.step(); n.step()
+check("...and only then does the rejoin start", n.mover.busy or n.rejoin_stage is not None
+      or d.last != (0.0, 0.0))
+
+n, s, cx, cy = recheck_nav(front=front_read, y=0.99)
+s.ready = False
+n._enter(M.AT_VICTIM)
+n.rescue.started = time.monotonic() - 100.0
+n.step()
+n.recheck_from = time.monotonic() - 10 * M.RECHECK_WAIT_S
+n.step()
+check("sonars that never answer: gives up after RECHECK_WAIT_S and carries on",
+      not n.rechecking and abs(n.odo.y - 0.99) < 1e-9)
+
+_r = M.RECHECK_AFTER_PICKUP
+M.RECHECK_AFTER_PICKUP = False
+n, s, cx, cy = recheck_nav(front=front_read, y=0.99)
+n._enter(M.AT_VICTIM)
+n.rescue.started = time.monotonic() - 100.0
+n.step()
+M.RECHECK_AFTER_PICKUP = _r
+check("RECHECK_AFTER_PICKUP = False skips it", not n.rechecking)
+
+# An off-grid move never drives into a wall the odometry didn't know about.
+def rejoin_mover(front):
+    sonar = FakeSonar(front=front)
+    odo = M.Localiser(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M, M.sonar_mounts())
+    odo.reset(0.14, 0.14, M.HEADING_RAD[MZ.NORTH])
+    mv = M.Mover(FakeDrive(ticks=(0, 0)), sonar, odo)
+    mv.move_to(0.14, 0.40, M.HEADING_RAD[MZ.NORTH], grid=False)     # 26cm to go
+    return mv
+mv = rejoin_mover(front=0.05)
+out = [mv.update() for _ in range(4)]
+check("rejoin drive with a wall 5cm ahead and 26cm 'to go': stops instead of driving on",
+      "arrived" in out and mv.drive.last == (0.0, 0.0))
+mv = rejoin_mover(front=0.60)
+out = [mv.update() for _ in range(4)]
+check("...but with a clear 60cm ahead it drives on", "arrived" not in out and mv.drive.last[0] > 0)
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE, M.MOCK_COLLECTION, M.TEST_MODE = _s39_saved
+
+
+print("40) the HAZARD marker: the dead-end cell in front of it is marked out of bounds")
+_s40_saved = (M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE)
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE = True, False, 0.0
+
+
+class HazVision(FakeVision):
+    """FakeVision plus the hazard marker in view (bearing in deg), or not (None)."""
+    def __init__(self, bearing=None):
+        super().__init__([])
+        self.marker, self.n_marker, self.obstacle, self.n_hazard = None, 0, None, 0
+        self.set(bearing)
+    def set(self, bearing):
+        self.hazard = None if bearing is None else M.Victim(bearing, None, (200, 40, 60, 60), 3600)
+        self.n_hazard = 0 if bearing is None else 1
+
+
+def haz_nav(bearing=0.0, front=0.90, cell=None, theta=None):
+    v = HazVision(bearing)
+    n = M.Nav(FakeDrive(ticks=(0, 0)), v, FakeLeds(), FakeSonar(front=front))
+    if cell is not None:
+        cx, cy = n.map.centre(cell)
+        n.cell = cell
+        n.odo.reset(cx, cy, M.HEADING_RAD[MZ.NORTH] if theta is None else theta)
+    return n, v
+
+
+# From the base cell (0,6) facing north, a wall at y = 1.12 (the north edge of row 3) is 0.98
+# from the turning centre -> front reads 0.90 (the sonar is 8cm ahead). The cell in front of
+# that wall is (0,3).
+n, v = haz_nav(0.0, 0.90)
+run(n, M.DETECTION_DEBOUNCE + 1)
+check("hazard marker confirmed: the cell in front of its wall, (0, 3), is blocked",
+      (0, 3) in n.map.blocked and (0, 3) in n.hazard_cells)
+check("...it is not mistaken for a victim (still exploring, yellow on, green off)",
+      n.state == M.SEARCH and n.leds.y is True and n.leds.g is not True)
+check("...the planners no longer reach it or count it as ground left to explore",
+      (0, 3) not in n.map.flood([n.base_cell], True) and (0, 3) not in n.map.frontier_cells())
+check("...and the base cell, the robot's own cell and the cells before the marker stay open",
+      all(c not in n.map.blocked for c in ((0, 6), (0, 5), (0, 4))))
+
+n, v = haz_nav(0.0, 0.90)
+run(n, M.DETECTION_DEBOUNCE - 1)
+check("two frames is not enough (debounced)", not n.map.blocked)
+
+n, v = haz_nav(25.0, 0.90)
+run(n, 6)
+check("marker well off the nose -> the sonar isn't ranging its wall: nothing marked",
+      (0, 3) not in n.map.blocked)
+
+n, v = haz_nav(0.0, None)
+run(n, 6)
+check("no front sonar reading -> can't place it: nothing marked", not n.hazard_cells)
+
+n, v = haz_nav(0.0, 0.90, theta=M.HEADING_RAD[MZ.NORTH] + 0.4)
+n.odo.reset(*n.map.centre(M.BASE_CELL), M.HEADING_RAD[MZ.NORTH] + 0.4)
+run(n, 6)
+check("pointing ~23 deg off the grid -> not placed", not n.hazard_cells)
+
+n, v = haz_nav(0.0, 0.06)
+run(n, 6)
+check("its cell is the base cell -> refused", M.BASE_CELL not in n.map.blocked and not n.hazard_cells)
+
+n, v = haz_nav(0.0, 0.90)
+n.victim_cell = (0, 3)
+run(n, 6)
+check("its cell has a victim in it -> refused", (0, 3) not in n.map.blocked)
+
+_hz = M.HAZARD_CUE_ENABLED
+M.HAZARD_CUE_ENABLED = False
+n, v = haz_nav(0.0, 0.90)
+run(n, 6)
+M.HAZARD_CUE_ENABLED = _hz
+check("HAZARD_CUE_ENABLED = False turns it off", not n.map.blocked)
+
+# Standing in the dead end when it is recognised: remembered, blocked only once it has left.
+n, v = haz_nav(0.0, 0.06, cell=(0, 3))
+run(n, 6)
+check("robot is IN the hazard cell: remembered but not blocked yet (it must be able to leave)",
+      (0, 3) in n.hazard_cells and (0, 3) not in n.map.blocked)
+n.cell = (0, 4)
+n._apply_hazards()
+check("...blocked as soon as it has left", (0, 3) in n.map.blocked)
+
+# A hazard that would seal the robot in: refused. Robot in the NW corner (0,0), east wall,
+# facing south; the only way out is through (0,1).
+n, v = haz_nav(0.0, 0.34, cell=(0, 0), theta=M.HEADING_RAD[MZ.SOUTH])
+n.map.set_wall((0, 0), M.EAST, True)
+n.mover.stop()
+run(n, 6)
+check("blocking it would cut the robot off from the base -> refused",
+      (0, 1) not in n.map.blocked and (0, 1) not in n.hazard_cells)
+
+# Already driving into it: turn back to the cell it left, and never go in.
+n, v = haz_nav(None, 0.34)                          # wall at y = 0.56 -> hazard cell (0, 5)
+run(n, 3)
+check("(setup) driving from the base cell towards (0, 5)",
+      n.mover.busy and n.target_cell == (0, 5))
+v.set(0.0)
+for _ in range(M.DETECTION_DEBOUNCE + 2):
+    n.step()
+    if (0, 5) in n.map.blocked:
+        break
+check("hazard recognised on the way in: (0, 5) blocked, and the move is turned back to the base",
+      (0, 5) in n.map.blocked and n.target_cell == M.BASE_CELL)
+run(n, 40)
+check("...and it never heads for the hazard cell afterwards", n.target_cell != (0, 5))
+
+# The vision wrapper: hazard markers come from the template matcher, not colour blobs.
+vv.system = _Sys([det("hazard", 100, 60, 4.0, None, ground=False),
+                  det("hazard", floor_y, 60, 0.0, 0.3, ground=True),      # a colour blob: ignored
+                  det("victim", 100, 60, 0.0, None, ground=False)])
+vv.look()
+check("VictimVision.hazard: the template-matched hazard marker, with its bearing",
+      vv.hazard is not None and abs(vv.hazard.bearing_deg - 4.0) < 1e-9 and vv.n_hazard == 1)
+vv.system = _Sys([det("victim", 100, 60, 0.0, None, ground=False)])
+vv.look()
+check("...a victim marker is not a hazard", vv.hazard is None and vv.n_hazard == 0)
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE = _s40_saved
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

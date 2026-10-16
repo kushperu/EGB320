@@ -424,6 +424,31 @@ MAX_TURN_RATE = 2.5         # rad/s
 DETECTION_DEBOUNCE = 3      # consecutive frames before believing a detection
 LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it lost
 
+# --- recheck the position after collecting a victim ---------------------------
+# Chasing the victim takes the robot off the grid: it steers by eye, its heading wanders off
+# the cardinal, and the cell it ends up in is usually one it has never mapped, so the
+# localiser (which corrects only against walls already on the map) has nothing to hold on
+# to. Left alone, the rejoin then drives "to the cell centre" on an odometry that may be
+# several cm out -- straight into the wall the victim was beside -- and spins up against it.
+# So, before moving at all, it stands still, takes a fresh set of sonar readings and
+# re-anchors the odometry to the walls:
+#   * ahead: a wall is always on a cell edge, so the reading fixes the position along the
+#     way it faces (the nearest edge that fits, within RECHECK_FRONT_SNAP_M -- anything
+#     else, e.g. the mechanism or the victim in front of the sonar, is ignored);
+#   * sideways: the side walls give the offset from the corridor centre, as in driving.
+# Readings only mean something when the robot points along the grid, so it needs to be
+# within RECHECK_MAX_SKEW_DEG of a cardinal heading.
+RECHECK_AFTER_PICKUP = True
+RECHECK_WAIT_S = 0.8            # max wait for a fresh set of pings
+RECHECK_MAX_SKEW_DEG = 12.0
+RECHECK_FRONT_MAX_M = 0.45      # a front reading longer than this isn't used
+RECHECK_FRONT_SNAP_M = 0.06     # ...and must match a cell edge to within this
+RECHECK_SIDE_MAX_M = 0.07       # side-wall correction bigger than this is not believed
+# A move that is not on the grid (the rejoin) has no wall-ahead check of its own, so it
+# stops when the front sonar reads this close: it is at least as near the wall as a robot
+# standing at a cell centre (FRONT_WALL_AT_CENTRE_M), and no centre is worth driving into one.
+REJOIN_WALL_STOP_M = 0.07
+
 # --- the victim's WALL MARKER as a cue -----------------------------------------
 # The exposed-victim marker hangs on the wall (centre ~120 mm up), so it is NOT on the
 # floor and the camera cannot range it by ground geometry -- driving at it as if it were
@@ -441,6 +466,22 @@ MARKER_BACK_OFF_M = 0.05                    # extra nudge from the wall towards 
                                             # sonar reading that comes out long still lands in
                                             # the cell BEFORE the wall, not in or past it
 MARKER_CELL_INSET_M = CELL_M / 2.0 + MARKER_BACK_OFF_M   # wall -> just inside the cell in front
+
+# --- the HAZARD marker: a dead end -----------------------------------------------
+# The hazard marker hangs on the end wall of a dead end, and the dead-end cell is the one
+# directly in front of it (assessment 5.2: continued exploration toward it "is unlikely to
+# assist"). When it is confirmed the cell in front of its wall is marked BLOCKED -- the
+# planners then never enter it, and it stops counting as ground left to explore -- found the
+# same way as the victim marker's cell (wall range from the front sonar, minus half a cell and
+# a small back-off). Never the base cell, a cell a victim is in, or the cell the robot is
+# standing in (that one is blocked as soon as it has left it).
+# The class name is the templates/<name>/ folder the hazard marker was captured into:
+#     python3 capture_marker_template.py hazard
+HAZARD_CUE_ENABLED = True
+HAZARD_CLASS_NAMES = ("hazard",)
+HAZARD_BACK_OFF_M = 0.05
+HAZARD_CELL_INSET_M = CELL_M / 2.0 + HAZARD_BACK_OFF_M
+HAZARD_HEADING_TOL_DEG = 10.0   # only place it while pointing along the grid
 
 # --- the blind run-in ---------------------------------------------------------
 # Close up, the victim drops out of the bottom of the frame: at CAMERA_HEIGHT_M with
@@ -601,7 +642,9 @@ def vision_summary(vision):
     blur_txt = "" if blur is None else f" blur{blur:.0f}"
     n_marker = getattr(vision, "n_marker", 0)
     marker_txt = f" marker {n_marker}" if n_marker else ""
-    return f"vis:{blur_txt} [{blobs}] victim {kept}/{raw}{marker_txt}"
+    n_hazard = getattr(vision, "n_hazard", 0)
+    hazard_txt = f" HAZARD {n_hazard}" if n_hazard else ""
+    return f"vis:{blur_txt} [{blobs}] victim {kept}/{raw}{marker_txt}{hazard_txt}"
 
 
 class Display:
@@ -722,6 +765,13 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
             cv2.putText(img, "victim marker", (mx, max(12, my - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1)
             txt += f"   MARKER x{getattr(vision, 'n_marker', 1)}"
+        hazard = getattr(vision, "hazard", None)
+        if hazard is not None:
+            hx, hy, hw, hh = hazard.bbox
+            cv2.rectangle(img, (hx, hy), (hx + hw, hy + hh), (0, 0, 255), 2)
+            cv2.putText(img, "hazard marker", (hx, max(12, hy - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+            txt += f"   HAZARD x{getattr(vision, 'n_hazard', 1)}"
         if getattr(nav, "heading_locked", False):
             txt += "   HEADING LOCKED"
         cv2.putText(img, txt, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
@@ -1314,6 +1364,16 @@ class Mover:
             elif fresh:
                 self.block_count = 0
 
+        if not self.grid and self.forward and remaining > ARRIVE_TOLERANCE_M:
+            # Off the grid there is no wall-ahead check above, and the odometry this target
+            # was worked out from may be out. A wall this close is as near as any cell centre
+            # gets (FRONT_WALL_AT_CENTRE_M): stop here rather than drive into it.
+            wall = self.sonar.front
+            if wall is not None and wall <= REJOIN_WALL_STOP_M:
+                STATUS.event(f"[nav] wall {wall*100:.0f}cm ahead with {remaining*100:.0f}cm "
+                             "still to go -- stopping here, not driving into it")
+                return self._arrive()
+
         if remaining <= ARRIVE_SLOW_M and self.near_since is None:
             self.near_since = now       # side walls read from here are this cell's
         if abs(remaining) <= ARRIVE_TOLERANCE_M or (remaining < 0 and self.forward):
@@ -1419,6 +1479,11 @@ class Mover:
         reads = self._side_reads()
         if reads is None:
             return None
+        return self._offset_from_reads(reads)
+
+    @staticmethod
+    def _offset_from_reads(reads):
+        """Metres right of the corridor centre from {"left"|"right": wall distance}."""
         if "left" in reads and "right" in reads:
             return (reads["left"] - reads["right"]) / 2.0
         if "right" in reads:
@@ -1666,6 +1731,8 @@ class VictimVision:
         self.marker = None          # the victim WALL MARKER in view (a Victim, no range)
         self.n_marker = 0
         self.obstacle = None        # the nearest floor OBSTACLE in view (a Victim), or None
+        self.hazard = None          # the HAZARD (dead-end) wall marker in view (a Victim, no range)
+        self.n_hazard = 0
 
         if use_placeholder:
             print("[vision] PLACEHOLDER detector -- not the real vision system")
@@ -1753,6 +1820,17 @@ class VictimVision:
         else:
             self.marker = None
 
+        # The hazard marker is a wall placard: always a template hit, never a colour blob.
+        hazards = [d for d in dets if HAZARD_CUE_ENABLED
+                   and d.get("class") in HAZARD_CLASS_NAMES
+                   and not d.get("is_ground_object", False)]
+        self.n_hazard = len(hazards)
+        if hazards:
+            hz = max(hazards, key=lambda d: d["bbox"][2] * d["bbox"][3])
+            self.hazard = Victim(hz["angle_deg"], None, hz["bbox"], hz["bbox"][2] * hz["bbox"][3])
+        else:
+            self.hazard = None
+
         # The nearest obstacle standing on the floor (a wall-mounted one is no use here).
         obstacles = [d for d in dets if OBSTACLE_AVOID
                      and d.get("class") == OBSTACLE_CLASS_NAME
@@ -1810,6 +1888,8 @@ class NullVision:
     marker = None
     n_marker = 0
     obstacle = None
+    hazard = None
+    n_hazard = 0
 
     def look(self):
         return None
@@ -1893,6 +1973,11 @@ class Nav:
         self.marker_hits = 0         # consecutive frames the victim's wall marker was in view
         self.done_cells = set()      # cells a victim was collected from (their marker stays up)
         self.marker_cell = None      # the cell the current marker cue placed a victim in
+        self.hazard_hits = 0         # consecutive frames the hazard marker was in view
+        self.hazard_cells = set()    # dead-end cells a hazard marker put out of bounds
+        self._hazard_refused = None  # the last cell a hazard marker named but was not allowed to block
+        self.rechecking = False      # standing still after a pickup, re-anchoring the odometry
+        self.recheck_from = None     # sonar readings newer than this count
         self._mock_announced = None       # arrived_at of the victim the mock collection announced
         self._edge_warned = set()         # (cell, heading) map-edge openings already reported
         self._creeping = False           # a short creep up to the front wall is under way
@@ -2064,9 +2149,12 @@ class Nav:
         if seen is not UNUSABLE:
             marker = getattr(self.vision, "marker", None)
             self.marker_hits = self.marker_hits + 1 if marker is not None else 0
+            hazard = getattr(self.vision, "hazard", None)
+            self.hazard_hits = self.hazard_hits + 1 if hazard is not None else 0
 
         if seen is not UNUSABLE:
             self._note_obstacle()
+            self._hazard_cue()
 
         confirmed = self.hits >= DETECTION_DEBOUNCE and self._wanted(self.victim)
         lost = self.misses > LOST_GRACE_FRAMES
@@ -2247,6 +2335,72 @@ class Nav:
             return
         self._set_leds()
         self._grid(self._plan_explore)
+
+    def _hazard_cue(self):
+        """The hazard marker is in view: the cell in front of its wall is a dead end, so
+        take it out of the map -- never to be entered, no longer ground left to explore.
+
+        Placed like the victim marker's cell: the front sonar ranges the marker's wall (only
+        believed while the marker is near the nose and the robot points along the grid), and
+        the cell is HAZARD_CELL_INSET_M back from it. It is refused, with the reason in the
+        log, if it is the base cell, a cell a victim is in, or if blocking it would cut the
+        robot off from the way home. The cell the robot is standing in is remembered and
+        blocked as soon as it has left it (a blocked start cell has no route out).
+        """
+        hz = getattr(self.vision, "hazard", None)
+        if (not HAZARD_CUE_ENABLED or hz is None or self.hazard_hits < DETECTION_DEBOUNCE
+                or self.state not in (SEARCH, SEEK, RETURN)
+                or abs(hz.bearing_deg) > US_TRUST_BEARING_DEG):
+            return
+        o = self.odo
+        if abs(wrap(o.theta - HEADING_RAD[nearest_heading(o.theta)])) > math.radians(
+                HAZARD_HEADING_TOL_DEG):
+            return                     # the sonar isn't ranging along a corridor
+        front = self.sonar.front
+        if front is None:
+            return
+        to_wall = front + (CELL_M / 2.0 - FRONT_WALL_AT_CENTRE_M)
+        reach = max(0.0, to_wall - HAZARD_CELL_INSET_M)
+        a = o.theta - math.radians(hz.bearing_deg)             # bearing is +ve RIGHT
+        cell = self.map.cell_at(o.x + reach * math.cos(a), o.y + reach * math.sin(a))
+        if cell in self.hazard_cells:
+            return
+        if cell == self.base_cell or cell == self.victim_cell:
+            if self._hazard_refused != cell:
+                self._hazard_refused = cell
+                STATUS.event(f"[nav] hazard marker seen, but its cell {cell} is the "
+                             f"{'base' if cell == self.base_cell else 'victim'} cell -- "
+                             "not blocking it")
+            return
+        if cell != self.cell:
+            # Would blocking it cut the robot off from the way home? Check before committing.
+            self.map.blocked.add(cell)
+            cut_off = self.cell not in self.map.flood([self.base_cell], True)
+            self.map.blocked.discard(cell)
+            if cut_off:
+                if self._hazard_refused != cell:
+                    self._hazard_refused = cell
+                    STATUS.event(f"[nav] hazard marker seen, but blocking {cell} would cut the "
+                                 "way back to base -- not blocking it")
+                return
+        self.hazard_cells.add(cell)
+        STATUS.event(f"[nav] HAZARD MARKER seen (wall {to_wall*100:.0f}cm ahead) -- cell {cell}, "
+                     f"the dead end in front of it, is out of bounds (robot is in {self.cell})")
+        if cell == self.cell:
+            STATUS.event("[nav] ...the robot is standing in it; it will be blocked once it has left")
+            return
+        self.map.blocked.add(cell)
+        if self.mover.busy and self.target_cell == cell:
+            # Already on its way in: turn back to the centre of the cell it left.
+            STATUS.event(f"[nav] heading into the hazard cell {cell} -- turning back to {self.cell}")
+            self.target_cell = self.cell
+            self.mover.move_to(*self.map.centre(self.cell), HEADING_RAD[self.move_heading])
+
+    def _apply_hazards(self):
+        """Block every remembered hazard cell the robot is no longer standing in."""
+        for hc in self.hazard_cells:
+            if hc != self.cell:
+                self.map.blocked.add(hc)
 
     def _marker_cue(self):
         """The victim's wall marker is in view and there is no victim object to chase:
@@ -2549,6 +2703,7 @@ class Nav:
             near = self.mover.near_since or now
             self.sense_from = {"front": now, "left": near, "right": near}
         self.sensing = self.cell not in self.map.visited
+        self._apply_hazards()
 
     def _rejoin(self):
         """Back onto the grid after chasing a victim: go to the centre of the cell it's
@@ -2829,11 +2984,96 @@ class Nav:
         self.victim_cell = self.marker_cell = None
         STATUS.event(f"[nav] victim collected after "
                      f"{time.monotonic() - self.arrived_at:.1f}s -- returning to base")
+        if RECHECK_AFTER_PICKUP:
+            self.rechecking = True               # find out where it really is before moving
+            self.recheck_from = time.monotonic()
         self._enter(RETURN)
 
     def _return(self):
         self._set_leds()
+        if self.rechecking and self._recheck_position():
+            return                               # still waiting for readings: don't move yet
         self._grid(self._plan_home)
+
+    def _recheck_position(self):
+        """Stand still after a pickup and re-anchor the odometry to the walls, before the
+        rejoin drives anywhere. True while it is still waiting for fresh readings."""
+        self.drive.stop()
+        now = time.monotonic()
+        fitted = [n for n in ("front", "left", "right")
+                  if n in getattr(self.sonar, "sensors", {})]
+        reads = {}
+        for n in fitted:
+            fresh, d = self.sonar.since(n, self.recheck_from)
+            if fresh:
+                reads[n] = d                     # d is None for "no echo"
+        if len(reads) < len(fitted) and now - self.recheck_from < RECHECK_WAIT_S:
+            return True
+        self.rechecking = False
+        self._fix_position(reads)
+        return False
+
+    def _fix_position(self, reads):
+        """Pull the odometry onto what the sonars say about the walls round it.
+
+        Ahead: a wall is on a cell edge, so the front reading puts the robot a known
+        distance from the nearest edge -- that fixes the position along the way it faces.
+        Sideways: the side walls give the offset from the corridor centre. Each is used
+        only if it agrees with the odometry to within a plausible error; a reading that
+        fits no wall (the victim, the collection mechanism) is left alone.
+        """
+        o = self.odo
+        facing = nearest_heading(o.theta)
+        skew = wrap(o.theta - HEADING_RAD[facing])
+        cell = self.map.cell_at(o.x, o.y)
+        if abs(skew) > math.radians(RECHECK_MAX_SKEW_DEG):
+            STATUS.event(f"[nav] position recheck: pointing {math.degrees(skew):+.0f} deg off a "
+                         "grid direction, too skewed for the sonars to say where it is -- "
+                         "rejoining on the odometry")
+            return
+        c = math.cos(skew)
+        ux, uy = round(math.cos(HEADING_RAD[facing])), round(math.sin(HEADING_RAD[facing]))
+        rx, ry = uy, -ux                          # unit vector to the robot's right
+        notes = []
+
+        front = reads.get("front")
+        if front is not None and front <= RECHECK_FRONT_MAX_M:
+            victim_ahead = ((MOCK_COLLECTION or TEST_MODE)
+                            and abs(front - STOP_DISTANCE_M) <= 0.025)
+            if victim_ahead:
+                notes.append(f"front {front*100:.0f}cm is the (mock) victim still in front -- "
+                             "not used")
+            else:
+                reach = (front + CELL_M / 2.0 - FRONT_WALL_AT_CENTRE_M) * c   # centre -> wall
+                sign = ux + uy                    # +1 facing E/N, -1 facing W/S
+                est = o.x * ux + o.y * uy + reach            # wall's coordinate, heading frame
+                edge = sign * round(sign * est / CELL_M) * CELL_M
+                delta = edge - est
+                if abs(delta) <= RECHECK_FRONT_SNAP_M:
+                    o.x += delta * ux
+                    o.y += delta * uy
+                    self._anchor_path = o.path_m
+                    notes.append(f"{delta*100:+.0f}cm along (wall {front*100:.0f}cm ahead)")
+                else:
+                    notes.append(f"front {front*100:.0f}cm matches no cell edge "
+                                 f"({abs(delta)*100:.0f}cm out) -- not used")
+
+        near = SIDE_WALL_AT_CENTRE_M + WALL_PRESENT_WINDOW_M
+        sides = {n: reads[n] * c for n in ("left", "right")
+                 if reads.get(n) is not None and reads[n] * c < near}
+        offset = Mover._offset_from_reads(sides)
+        if offset is not None:
+            cx, cy = self.map.centre(cell)
+            delta = offset - ((o.x - cx) * rx + (o.y - cy) * ry)
+            if abs(delta) <= RECHECK_SIDE_MAX_M:
+                o.x += delta * rx
+                o.y += delta * ry
+                notes.append(f"{delta*100:+.0f}cm across (walls say {offset*100:+.0f}cm off centre)")
+            else:
+                notes.append(f"side walls say {offset*100:+.0f}cm off centre, "
+                             f"{abs(delta)*100:.0f}cm from the odometry -- not used")
+        STATUS.event(f"[nav] position rechecked after pickup in {cell}: "
+                     + (", ".join(notes) if notes else "no wall in range to check against"))
 
     def _at_base(self):
         """Home with a victim. Release it, then go back out for the next one."""
