@@ -399,6 +399,19 @@ MAX_TURN_RATE = 2.5         # rad/s
 DETECTION_DEBOUNCE = 3      # consecutive frames before believing a detection
 LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it lost
 
+# --- the victim's WALL MARKER as a cue -----------------------------------------
+# The exposed-victim marker hangs on the wall (centre ~120 mm up), so it is NOT on the
+# floor and the camera cannot range it by ground geometry -- driving at it as if it were
+# the token would drive into the wall. But it does say a victim is near. So when the
+# marker is confirmed and no victim object is in view, nav places a victim in the cell IN
+# FRONT of the marker (wall range from the front sonar, minus half a cell), lights the
+# green LED and goes there to look (SEEK). The usual sonar check then decides whether
+# there is really something to close in on. A victim OBJECT on the floor always wins.
+MARKER_CUE_ENABLED = True
+MARKER_CLASS_NAMES = (VICTIM_CLASS_NAME,)   # marker classes that mean "a victim is here":
+                                            # the template folder under vision/templates/
+MARKER_CELL_INSET_M = CELL_M / 2.0          # wall -> centre of the cell in front of it
+
 # --- the blind run-in ---------------------------------------------------------
 # Close up, the victim drops out of the bottom of the frame: at CAMERA_HEIGHT_M with
 # VERTICAL_FOV_DEG, an object on the floor stops being visible somewhere under
@@ -556,7 +569,9 @@ def vision_summary(vision):
     kept = getattr(vision, "n_victim_kept", 0)
     blur = getattr(vision, "last_blur", None)
     blur_txt = "" if blur is None else f" blur{blur:.0f}"
-    return f"vis:{blur_txt} [{blobs}] victim {kept}/{raw}"
+    n_marker = getattr(vision, "n_marker", 0)
+    marker_txt = f" marker {n_marker}" if n_marker else ""
+    return f"vis:{blur_txt} [{blobs}] victim {kept}/{raw}{marker_txt}"
 
 
 class Display:
@@ -670,6 +685,13 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
                "blobs: " + "  ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
         txt += f"   victim kept {getattr(vision,'n_victim_kept',0)}" \
                f"/{getattr(vision,'n_victim_raw',0)}"
+        marker = getattr(vision, "marker", None)
+        if marker is not None:
+            mx, my, mw, mh = marker.bbox
+            cv2.rectangle(img, (mx, my), (mx + mw, my + mh), (0, 140, 255), 2)
+            cv2.putText(img, "victim marker", (mx, max(12, my - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1)
+            txt += f"   MARKER x{getattr(vision, 'n_marker', 1)}"
         if getattr(nav, "heading_locked", False):
             txt += "   HEADING LOCKED"
         cv2.putText(img, txt, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
@@ -1541,6 +1563,8 @@ class VictimVision:
         self.class_counts = {}
         self.n_victim_raw = 0
         self.n_victim_kept = 0
+        self.marker = None          # the victim WALL MARKER in view (a Victim, no range)
+        self.n_marker = 0
 
         if use_placeholder:
             print("[vision] PLACEHOLDER detector -- not the real vision system")
@@ -1575,8 +1599,18 @@ class VictimVision:
             return False                       # colour hit on the wall marker
         return True
 
+    def _is_marker(self, det):
+        """Is this detection the victim's WALL MARKER? The mirror of _is_target: a
+        marker-template hit, or a victim-coloured blob whose base is up the wall."""
+        if det.get("class") not in MARKER_CLASS_NAMES:
+            return False
+        if not det.get("is_ground_object", False):
+            return True                        # a marker-template hit
+        return not is_on_floor(det["bbox"], self.frame_h)
+
     def look(self):
-        """The nearest victim, None if there isn't one, UNUSABLE if we can't tell."""
+        """The nearest victim, None if there isn't one, UNUSABLE if we can't tell.
+        The victim's wall marker, if one is in view, is left in self.marker."""
         frame = self.camera.read()
         self.last_frame = frame
         if frame is None:
@@ -1609,6 +1643,14 @@ class VictimVision:
         for d in dets:
             counts[d.get("class", "?")] = counts.get(d.get("class", "?"), 0) + 1
         self.class_counts = counts
+
+        markers = [d for d in dets if MARKER_CUE_ENABLED and self._is_marker(d)]
+        self.n_marker = len(markers)
+        if markers:
+            m = max(markers, key=lambda d: d["bbox"][2] * d["bbox"][3])
+            self.marker = Victim(m["angle_deg"], None, m["bbox"], m["bbox"][2] * m["bbox"][3])
+        else:
+            self.marker = None
 
         raw = [d for d in dets if d.get("class") == VICTIM_CLASS_NAME]
         victims = [d for d in raw if self._is_target(d)]
@@ -1651,6 +1693,8 @@ class NullVision:
     last_frame = None
     last_detections = []
     draw_detections = None
+    marker = None
+    n_marker = 0
 
     def look(self):
         return None
@@ -1731,6 +1775,9 @@ class Nav:
         self.block_tries = {}        # (cell, heading) -> drives that were blocked
         self.closing_heading = None  # heading CLOSING holds
         self.rescued = 0
+        self.marker_hits = 0         # consecutive frames the victim's wall marker was in view
+        self.done_cells = set()      # cells a victim was collected from (their marker stays up)
+        self.marker_cell = None      # the cell the current marker cue placed a victim in
         self._mock_announced = None       # arrived_at of the victim the mock collection announced
         self._edge_warned = set()         # (cell, heading) map-edge openings already reported
         self._creeping = False           # a short creep up to the front wall is under way
@@ -1782,7 +1829,7 @@ class Nav:
         if state in (SEARCH, RETURN):
             self.closing_heading = None
         if state == SEARCH:
-            self.victim_cell = None
+            self.victim_cell = self.marker_cell = None
             self._announced = False
             self.aligned = False
             self.heading_locked = False
@@ -1899,8 +1946,11 @@ class Nav:
             self._victim_seen_at = time.monotonic()
         else:
             self.misses, self.hits = self.misses + 1, 0
+        if seen is not UNUSABLE:
+            marker = getattr(self.vision, "marker", None)
+            self.marker_hits = self.marker_hits + 1 if marker is not None else 0
 
-        confirmed = self.hits >= DETECTION_DEBOUNCE and self._wanted(self.victim)
+        confirmed =self.hits >= DETECTION_DEBOUNCE and self._wanted(self.victim)
         lost = self.misses > LOST_GRACE_FRAMES
 
         if self.state == SEARCH:
@@ -2059,8 +2109,47 @@ class Nav:
                 self._leave_grid()
                 self.drive.stop()
             return
+        if self._marker_cue():
+            return
         self._set_leds()
         self._grid(self._plan_explore)
+
+    def _marker_cue(self):
+        """The victim's wall marker is in view and there is no victim object to chase:
+        place a victim in the cell in front of the marker, light green and go and look
+        there. True if it committed (state is now SEEK).
+
+        The cell comes from the front sonar, which is only believed while the marker is
+        near the nose (it then ranges the marker's own wall). From the turning centre the
+        wall is the sonar reading plus the sonar's offset; the cell in front of it is half
+        a cell back from there. SEEK then drives there, and the usual sonar check at the
+        last step decides whether anything is really standing in it.
+        """
+        marker = getattr(self.vision, "marker", None)
+        if (not MARKER_CUE_ENABLED or marker is None or self.carrying
+                or self.marker_hits < DETECTION_DEBOUNCE
+                or abs(marker.bearing_deg) > US_TRUST_BEARING_DEG):
+            return False
+        front = self.sonar.front
+        if front is None:
+            return False
+        o = self.odo
+        to_wall = front + (CELL_M / 2.0 - FRONT_WALL_AT_CENTRE_M)
+        reach = max(0.0, to_wall - MARKER_CELL_INSET_M)
+        a = o.theta - math.radians(marker.bearing_deg)        # bearing is +ve RIGHT
+        cell = self.map.cell_at(o.x + reach * math.cos(a), o.y + reach * math.sin(a))
+        if (cell in self.done_cells or self.seek_tries.get(cell, 0) >= SEEK_ATTEMPTS
+                or (self.rescued > 0 and cell == self.base_cell)):
+            return False
+        self.victim_cell = self.marker_cell = cell
+        self.map.blocked.discard(cell)
+        self.leds.green(True)                          # green the moment we commit
+        self.leds.yellow(False)
+        self._announced = True
+        STATUS.event(f"[nav] VICTIM MARKER seen (wall {to_wall*100:.0f}cm ahead) -- green LED "
+                     f"on, looking for the victim in cell {cell}")
+        self._enter(SEEK)
+        return True
 
     # -- the grid ------------------------------------------------------------
     def _grid(self, plan):
@@ -2587,7 +2676,10 @@ class Nav:
             # the victim standing just beyond it once read as a wall.
             if self.map.heading_between(self.cell, self.victim_cell) == self.facing:
                 self.map.set_wall(self.cell, self.facing, False)
-        self.victim_cell = None
+        for done in (self.victim_cell, self.marker_cell):
+            if done is not None:
+                self.done_cells.add(done)                # its wall marker is still up: ignore it
+        self.victim_cell = self.marker_cell = None
         STATUS.event(f"[nav] victim collected after "
                      f"{time.monotonic() - self.arrived_at:.1f}s -- returning to base")
         self._enter(RETURN)

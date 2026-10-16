@@ -1688,5 +1688,105 @@ import ultrasonic_test as _UT
 check("ultrasonic_test.py uses the same pins as main.py",
       all(_UT.SENSOR_PINS[k] == M.ULTRASONIC_PINS[k] for k in ("front", "left", "right")))
 
+print("37) the victim's WALL MARKER: green, and go and look in the cell in front of it")
+# The marker hangs on the wall, so the camera can't range it -- but it says a victim is near.
+# With no victim object in view, nav places a victim half a cell in front of the marker's wall
+# (wall range from the front sonar), lights green and goes to look (SEEK).
+class MarkerVision(FakeVision):
+    """FakeVision plus the victim's wall marker in view (bearing in deg), or not (None)."""
+    def __init__(self, bearing=None, script=()):
+        super().__init__(list(script))
+        self.set(bearing)
+    def set(self, bearing):
+        self.marker = None if bearing is None else M.Victim(bearing, None, (200, 40, 60, 60), 3600)
+        self.n_marker = 0 if bearing is None else 1
+
+
+def marker_nav(bearing=0.0, front=0.80, script=()):
+    v = MarkerVision(bearing, script)
+    return M.Nav(FakeDrive(ticks=(0, 0)), v, FakeLeds(), FakeSonar(front=front)), v
+
+
+def marker_cell(n, front):
+    """Where the cue should put the victim, worked out from the geometry independently."""
+    wall = front + (M.CELL_M / 2 - M.FRONT_WALL_AT_CENTRE_M)
+    return n.map.cell_at(n.odo.x, n.odo.y + wall - M.MARKER_CELL_INSET_M)   # facing north
+
+n, v = marker_nav(0.0, 0.80)
+want = marker_cell(n, 0.80)
+run(n, M.DETECTION_DEBOUNCE + 1)
+check("marker confirmed, nothing on the floor -> SEEK", n.state == M.SEEK)
+check("...green on, yellow off", n.leds.g is True and n.leds.y is False)
+check(f"...a victim placed in the cell in front of the marker's wall {want}", n.victim_cell == want)
+check("...and that cell remembered as the marker's", n.marker_cell == want)
+
+n, v = marker_nav(0.0, 0.80)
+run(n, M.DETECTION_DEBOUNCE - 1)
+check("two frames is not enough (debounced)", n.state == M.SEARCH and n.leds.g is not True)
+
+n, v = marker_nav(25.0, 0.80)
+run(n, 6)
+check("marker well off the nose -> the sonar isn't ranging its wall: no cue", n.state == M.SEARCH)
+
+n, v = marker_nav(0.0, None)
+run(n, 6)
+check("no front sonar reading -> can't place it, no cue (and green stays off)",
+      n.state == M.SEARCH and n.leds.g is not True)
+
+n, v = marker_nav(0.0, 0.80)
+n.done_cells.add(marker_cell(n, 0.80))
+run(n, 6)
+check("a cell already collected from is ignored (its marker is still on the wall)",
+      n.state == M.SEARCH)
+
+n, v = marker_nav(0.0, 0.80)
+n.seek_tries[marker_cell(n, 0.80)] = M.SEEK_ATTEMPTS
+run(n, 6)
+check("a cell that has failed its sonar check SEEK_ATTEMPTS times is not tried again",
+      n.state == M.SEARCH)
+
+n, v = marker_nav(0.0, 0.80)
+n.carrying = True
+run(n, 6)
+check("carrying a victim: markers are ignored", n.state != M.SEEK)
+
+_enabled = M.MARKER_CUE_ENABLED
+M.MARKER_CUE_ENABLED = False
+n, v = marker_nav(0.0, 0.80)
+run(n, 6)
+M.MARKER_CUE_ENABLED = _enabled
+check("MARKER_CUE_ENABLED = False turns it off", n.state == M.SEARCH)
+
+n, v = marker_nav(0.0, 0.80, script=[V(bearing=0.0)] * 8)
+run(n, M.DETECTION_DEBOUNCE + 1)
+check("a victim OBJECT in view still wins: the usual path, not the marker's",
+      n.state == M.SEEK and n.marker_cell is None)
+
+n, v = marker_nav(0.0, 0.80)
+n.victim_cell, n.marker_cell = (0, 2), (0, 3)
+n._enter(M.AT_VICTIM)
+n.rescue.started = M.time.monotonic() - 100.0
+n._at_victim()
+check("collecting records both the victim's cell and the marker's as done",
+      {(0, 2), (0, 3)} <= n.done_cells and n.marker_cell is None)
+
+print("37a) telling the marker from the object")
+vv = M.VictimVision.__new__(M.VictimVision)            # no camera: just the geometry
+vv.frame_h = 480
+hy = M.horizon_row(480)
+check("a marker-template hit is a marker",
+      vv._is_marker({"class": "victim", "is_ground_object": False, "bbox": (10, 100, 50, 50)}))
+check("a victim-coloured blob up the wall (base above the horizon) is a marker",
+      vv._is_marker({"class": "victim", "is_ground_object": True, "bbox": (10, int(hy) - 90, 50, 50)}))
+check("...but one standing on the floor is the OBJECT, not a marker",
+      not vv._is_marker({"class": "victim", "is_ground_object": True, "bbox": (10, int(hy) + 60, 50, 50)}))
+check("another class (the base marker, say) is not a victim marker",
+      not vv._is_marker({"class": "base", "is_ground_object": False, "bbox": (10, 100, 50, 50)}))
+import types as _types
+check("the status line says when a marker is in view",
+      "marker 1" in M.vision_summary(_types.SimpleNamespace(n_marker=1)))
+check("...and says nothing when there isn't one",
+      "marker" not in M.vision_summary(_types.SimpleNamespace(n_marker=0)))
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
