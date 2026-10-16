@@ -16,6 +16,7 @@ the walls, and holds heading from the encoders so neither track falls behind.
     python3 main.py --no-camera          # explore and map only, no vision at all
     python3 main.py --camera-walls       # ALSO use the camera to see walls (off by default)
     python3 main.py --no-centring        # encoder heading hold only, no sonar centring
+    python3 main.py --no-avoid           # don't sidestep obstacles the camera sees
     python3 main.py --test-mode          # demo: ONE victim, flash all LEDs 5 s, home, done
     python3 straight_test.py             # does it drive straight? motors + encoders only
     python3 main.py --base-cell 6,6 --start-heading W   # base in another corner
@@ -286,6 +287,30 @@ USE_CAMERA_WALLS = False
 # Steer back to the corridor centre from the side sonars. --no-centring turns it off,
 # leaving encoder heading hold alone, to find out whether a veer is the motors or this.
 CENTRING = True
+
+# --- going round an obstacle that sits to one side of the corridor ------------------
+# The camera sees a floor OBSTACLE ahead, off to one side. Rather than drive at it until
+# the front sonar says "blocked" and give up the cell, steer to the OPPOSITE side of the
+# corridor and slide past in the gap. Measured on the real field: the obstacle is ~12 cm
+# wide and the robot has ~2 cm either side of it when alongside -- so the obstacle stands
+# against one wall, the gap is CELL_M - OBSTACLE_WIDTH_M = 16 cm, and the robot (~12 cm)
+# has to run down the MIDDLE OF THE GAP, which is OBSTACLE_WIDTH_M / 2 off the corridor
+# centreline. An obstacle in the middle of the corridor (nearer than OBSTACLE_MIN_SIDE_M
+# to the centreline) leaves a gap too small for the robot, so that is still treated as
+# blocked and detoured round, as before.
+# Alongside the obstacle both side sonars read it and the far wall at ~2 cm each, so the
+# normal two-wall centring keeps it in the middle of the gap with no help from here.
+OBSTACLE_AVOID = True
+OBSTACLE_CLASS_NAME = "obstacle"   # matches the profiles.pkl class
+OBSTACLE_WIDTH_M = 0.12
+OBSTACLE_PASS_OFFSET_M = OBSTACLE_WIDTH_M / 2.0   # how far off the centreline to run
+OBSTACLE_MIN_SIDE_M = 0.03     # obstacle centre must be at least this off the centreline
+OBSTACLE_SEE_MAX_M = 0.50      # ignore obstacles the camera ranges further than this
+OBSTACLE_ASSUMED_RANGE_M = 0.25  # used when the camera can't range it (no geometry)
+OBSTACLE_CLEAR_M = 0.12        # keep sidestepping this far past it (the camera loses sight
+                               # of it once it is under the lens, well before we're past)
+OBSTACLE_ALONGSIDE_M = 0.05    # an obstacle-side sonar reading under this = we're beside it
+OBSTACLE_FRONT_STOP_M = 0.07   # while sidestepping, only call it blocked this close
 CAMERA_WALL_WEIGHT = 0.7    # camera's share of the centring offset when both agree
                             # (it updates ~20x a second, the sonars ~7x)
 CAMERA_AGREE_M = 0.03       # ...agree = within this; further apart, trust the sonars
@@ -981,6 +1006,46 @@ class Mover:
         self.phase = self.IDLE
         self.lateral = None                         # m right of centre, for the HUD
         self.near_since = None
+        self.avoid = None       # (shift m right of centre, remaining at which it's past)
+
+    @property
+    def avoiding(self):
+        return self.avoid is not None
+
+    def note_obstacle(self, side_m, ahead_m):
+        """The camera sees a floor obstacle `ahead_m` in front, `side_m` right of the
+        corridor centreline (negative = left). Called by Nav on every sighting.
+
+        Latches a sidestep to the opposite side for the rest of the way past it: the
+        camera loses it long before the robot is level with it, and the side sonars only
+        pick it up once it is alongside. Does nothing off the grid, when not driving
+        forwards, or when the obstacle is too near the middle for the robot to squeeze by.
+        """
+        if (not OBSTACLE_AVOID or self.phase != self.DRIVE or not self.grid
+                or not self.forward or abs(side_m) < OBSTACLE_MIN_SIDE_M):
+            return
+        o = self.odo
+        ux, uy = math.cos(self.heading), math.sin(self.heading)
+        remaining = (self.target[0] - o.x) * ux + (self.target[1] - o.y) * uy
+        shift = -math.copysign(OBSTACLE_PASS_OFFSET_M, side_m)    # away from it
+        first = self.avoid is None
+        self.avoid = (shift, remaining - ahead_m - OBSTACLE_CLEAR_M)
+        if first:
+            STATUS.event(f"[nav] obstacle {abs(side_m)*100:.0f}cm to the "
+                         f"{'right' if side_m > 0 else 'left'} of centre, {ahead_m*100:.0f}cm "
+                         f"ahead -- sliding {OBSTACLE_PASS_OFFSET_M*100:.0f}cm "
+                         f"{'left' if side_m > 0 else 'right'} to go past")
+
+    def _avoid_shift(self, remaining):
+        """The sidestep in force (metres right of centre), 0.0 when none; ends it once
+        the robot is past the obstacle."""
+        if self.avoid is None:
+            return 0.0
+        shift, until = self.avoid
+        if remaining <= until:
+            self.avoid = None
+            return 0.0
+        return shift
 
     @property
     def busy(self):
@@ -1007,6 +1072,7 @@ class Mover:
         self.block_count = 0
         self.block_info = None          # (front reading, distance to go) when blocked
         self._front_stamp = None
+        self.avoid = None               # a sidestep belongs to one leg
         now = time.monotonic()
         self.phase_started = now
         if abs(wrap(heading - self.odo.theta)) > TURN_TOLERANCE_RAD:
@@ -1231,7 +1297,13 @@ class Mover:
             front, stamp = self._front_reading()
             fresh = stamp is not None and stamp != self._front_stamp
             self._front_stamp = stamp
-            if front is not None and front - FRONT_WALL_AT_CENTRE_M < remaining - BLOCK_MARGIN_M:
+            # Sidestepping an obstacle the camera has already seen: the front sonar will
+            # read it (the cone is wide at first), but we're going round, so only call it
+            # blocked once it's nearly touching.
+            going_round = (front is not None and self.avoid is not None
+                           and front >= OBSTACLE_FRONT_STOP_M)
+            if (front is not None and not going_round
+                    and front - FRONT_WALL_AT_CENTRE_M < remaining - BLOCK_MARGIN_M):
                 if fresh:
                     self.block_count += 1
                 if self.block_count >= BLOCK_CONFIRM:
@@ -1264,8 +1336,16 @@ class Mover:
         self.lateral = self._blended_offset() if CENTRING else 0.0
         if self.lateral is None:
             self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
+        steer_off = self.lateral             # self.lateral stays where the robot really is
+        shift = self._avoid_shift(remaining)
+        if shift and not self._beside_obstacle(shift):
+            # Aim for the middle of the gap, not the middle of the corridor: being "shift"
+            # off the centreline is on target. (Once the obstacle is alongside, both
+            # sonars read it and the far wall at about the same range, so the plain
+            # two-wall offset already is the middle of the gap.)
+            steer_off -= shift
         if STEER_WHILE_DRIVING or not self.grid:
-            aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
+            aim = self.heading + _clamp(CENTRE_GAIN * steer_off, MAX_CENTRE_ANGLE)
             err = wrap(aim - o.theta)
             w = _clamp(HEADING_HOLD_GAIN * err, MAX_STEER_RATE)
             if STEER_MIN_RATE > 0.0:
@@ -1336,6 +1416,20 @@ class Mover:
         an opening, and is ignored. Valid only while pointing along the corridor,
         which is when this is called.
         """
+        reads = self._side_reads()
+        if reads is None:
+            return None
+        if "left" in reads and "right" in reads:
+            return (reads["left"] - reads["right"]) / 2.0
+        if "right" in reads:
+            return SIDE_WALL_AT_CENTRE_M - reads["right"]
+        if "left" in reads:
+            return reads["left"] - SIDE_WALL_AT_CENTRE_M
+        return None
+
+    def _side_reads(self):
+        """{"left"|"right": metres} for each side sonar with a fresh reading that is
+        close enough to be this corridor's wall; None if the sonars can't say at all."""
         get = getattr(self.sonar, "get", None)
         stamp = getattr(self.sonar, "stamp", None)
         if get is None or stamp is None:
@@ -1347,13 +1441,14 @@ class Mover:
             t, d = stamp(name), get(name)
             if t is not None and d is not None and now - t <= SIDE_FRESH_S and d < near:
                 reads[name] = d
-        if "left" in reads and "right" in reads:
-            return (reads["left"] - reads["right"]) / 2.0
-        if "right" in reads:
-            return SIDE_WALL_AT_CENTRE_M - reads["right"]
-        if "left" in reads:
-            return reads["left"] - SIDE_WALL_AT_CENTRE_M
-        return None
+        return reads
+
+    def _beside_obstacle(self, shift):
+        """Is the obstacle alongside? The sonar on ITS side (opposite the sidestep) reads
+        far closer than any wall could be from a robot sitting in the gap."""
+        reads = self._side_reads() or {}
+        d = reads.get("right" if shift < 0 else "left")
+        return d is not None and d < OBSTACLE_ALONGSIDE_M
 
     def _check_odometry(self, now, ux, uy):
         """Say so, once, if the encoders aren't keeping up with the drive command."""
@@ -1570,6 +1665,7 @@ class VictimVision:
         self.n_victim_kept = 0
         self.marker = None          # the victim WALL MARKER in view (a Victim, no range)
         self.n_marker = 0
+        self.obstacle = None        # the nearest floor OBSTACLE in view (a Victim), or None
 
         if use_placeholder:
             print("[vision] PLACEHOLDER detector -- not the real vision system")
@@ -1657,6 +1753,19 @@ class VictimVision:
         else:
             self.marker = None
 
+        # The nearest obstacle standing on the floor (a wall-mounted one is no use here).
+        obstacles = [d for d in dets if OBSTACLE_AVOID
+                     and d.get("class") == OBSTACLE_CLASS_NAME
+                     and d.get("is_ground_object", False)
+                     and is_on_floor(d["bbox"], self.frame_h)]
+        if obstacles:
+            # nearest = lowest base in the image; with no range that is the best proxy
+            o = max(obstacles, key=lambda d: d["bbox"][1] + d["bbox"][3])
+            self.obstacle = Victim(o["angle_deg"], o.get("distance_m"), o["bbox"],
+                                   o["bbox"][2] * o["bbox"][3])
+        else:
+            self.obstacle = None
+
         raw = [d for d in dets if d.get("class") == VICTIM_CLASS_NAME]
         victims = [d for d in raw if self._is_target(d)]
         self.n_victim_raw, self.n_victim_kept = len(raw), len(victims)
@@ -1700,6 +1809,7 @@ class NullVision:
     draw_detections = None
     marker = None
     n_marker = 0
+    obstacle = None
 
     def look(self):
         return None
@@ -1955,6 +2065,9 @@ class Nav:
             marker = getattr(self.vision, "marker", None)
             self.marker_hits = self.marker_hits + 1 if marker is not None else 0
 
+        if seen is not UNUSABLE:
+            self._note_obstacle()
+
         confirmed = self.hits >= DETECTION_DEBOUNCE and self._wanted(self.victim)
         lost = self.misses > LOST_GRACE_FRAMES
 
@@ -1974,6 +2087,22 @@ class Nav:
             self._at_base()
         elif self.state == DONE:
             self._done()
+
+    def _note_obstacle(self):
+        """Hand a floor obstacle the camera can see to the mover, as (metres right of the
+        corridor centreline, metres ahead), so it can slide to the other side of the
+        corridor to pass it. Only while driving a grid leg -- the mover ignores it
+        otherwise -- and only for ones near enough to matter."""
+        ob = getattr(self.vision, "obstacle", None)
+        if not OBSTACLE_AVOID or ob is None or not self.mover.busy:
+            return
+        rng = ob.distance_m if ob.distance_m is not None else OBSTACLE_ASSUMED_RANGE_M
+        if rng > OBSTACLE_SEE_MAX_M:
+            return
+        bearing = math.radians(ob.bearing_deg)           # +ve = right of the nose
+        ahead = rng * math.cos(bearing)
+        own = self.mover.lateral or 0.0                  # where we are in the corridor
+        self.mover.note_obstacle(own + rng * math.sin(bearing), ahead)
 
     def _look_at_walls(self):
         """Run the wall detector on the frame vision just grabbed (once per frame)."""
@@ -2734,7 +2863,7 @@ class Nav:
 
 
 def main():
-    global CENTRING, TEST_MODE
+    global CENTRING, TEST_MODE, OBSTACLE_AVOID
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
@@ -2766,6 +2895,9 @@ def main():
                          "return home and finish")
     ap.add_argument("--no-centring", action="store_true",
                     help="don't steer back to the corridor centre -- encoder heading hold only")
+    ap.add_argument("--no-avoid", action="store_true",
+                    help="don't sidestep obstacles the camera sees -- a blocked cell is "
+                         "detoured round instead")
     ap.add_argument("--base-cell", default=None,
                     help=f"base cell as col,row (default {BASE_CELL[0]},{BASE_CELL[1]})")
     ap.add_argument("--start-heading", choices=["N", "E", "S", "W"], default=None,
@@ -2813,6 +2945,9 @@ def main():
     if args.no_centring:
         CENTRING = False
         STATUS.event("[nav] --no-centring: encoder heading hold only")
+    if args.no_avoid:
+        OBSTACLE_AVOID = False
+        STATUS.event("[nav] --no-avoid: obstacles are not sidestepped")
     STATUS.enabled = not args.no_status
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)

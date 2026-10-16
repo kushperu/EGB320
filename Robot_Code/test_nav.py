@@ -1839,5 +1839,158 @@ check("then the object appears while seeking -> its cell replaces the marker's",
 check("...and the marker's cell is still remembered, so it is ignored after the rescue",
       n.marker_cell == first)
 
+print("38) an OBSTACLE to one side of the corridor: slide to the other side and go past")
+_s38_saved = (M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE)
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE = True, False, 0.0   # plain proportional
+# Field facts (measured): the obstacle is ~12 cm wide, the cell 28 cm, and the robot has ~2 cm
+# either side of it when alongside -- so the obstacle stands against one wall and the robot has
+# to run down the middle of the 16 cm gap, OBSTACLE_PASS_OFFSET_M = 6 cm off the centreline.
+class ObVision(FakeVision):
+    """FakeVision with a floor obstacle in view: bearing in deg (+ = right), camera range m."""
+    def __init__(self, bearing=None, dist=0.25):
+        super().__init__([])
+        self.marker, self.n_marker = None, 0
+        self.set(bearing, dist)
+    def set(self, bearing, dist=0.25):
+        self.obstacle = None if bearing is None else M.Victim(bearing, dist, (200, 150, 60, 60), 3600)
+
+
+class GapSonar(FakeSonar):
+    """Front + side sonars with FRESH side stamps (FakeSonar's counter would read as stale)."""
+    def __init__(self, left=M.SIDE_WALL_AT_CENTRE_M, right=M.SIDE_WALL_AT_CENTRE_M, front=1.0):
+        super().__init__(front=front)
+        self.l, self.r = left, right
+        self.sensors = {"front": 1, "left": 1, "right": 1}
+    def get(self, name):
+        return {"front": self.front, "left": self.l, "right": self.r}[name]
+    def stamp(self, name):
+        return self._n if name == "front" else time.monotonic()
+
+
+def ob_nav(bearing=None, dist=0.25, left=M.SIDE_WALL_AT_CENTRE_M, right=M.SIDE_WALL_AT_CENTRE_M,
+           front=1.0, ticks=8):
+    v, s, d = ObVision(bearing, dist), GapSonar(left, right, front), FakeDrive(ticks=(0, 0))
+    n = M.Nav(d, v, FakeLeds(), s)
+    run(n, ticks)
+    return n, v, s, d
+
+
+def steer(d):
+    return 0 if abs(d.last[1]) < 1e-6 else (1 if d.last[1] > 0 else -1)
+
+
+n, v, s, d = ob_nav()
+check("(setup) nothing in view, centred: drives dead straight", steer(d) == 0 and d.last[0] > 0)
+
+n, v, s, d = ob_nav(bearing=30.0)
+check("obstacle off to the RIGHT -> a sidestep is latched", n.mover.avoiding)
+check(f"...to the LEFT by {M.OBSTACLE_PASS_OFFSET_M*100:.0f}cm (half the obstacle width)",
+      abs(n.mover.avoid[0] + M.OBSTACLE_PASS_OFFSET_M) < 1e-9)
+check("...and steers LEFT, away from it, while still driving forward", steer(d) == 1 and d.last[0] > 0)
+
+n, v, s, d = ob_nav(bearing=-30.0)
+check("obstacle off to the LEFT -> steers RIGHT", n.mover.avoiding and steer(d) == -1 and d.last[0] > 0)
+
+n, v, s, d = ob_nav(bearing=0.0)
+check("obstacle dead ahead (centred): too little room to squeeze past, so no sidestep",
+      not n.mover.avoiding)
+n, v, s, d = ob_nav(bearing=5.0)
+check("...nor when it is only ~2cm off centre (inside OBSTACLE_MIN_SIDE_M)", not n.mover.avoiding)
+
+n, v, s, d = ob_nav(bearing=30.0, dist=None)
+check("camera can't range it -> an assumed range is used, and it still sidesteps",
+      n.mover.avoiding and steer(d) == 1)
+
+n, v, s, d = ob_nav(bearing=30.0, dist=M.OBSTACLE_SEE_MAX_M + 0.2)
+check("an obstacle further off than OBSTACLE_SEE_MAX_M is not acted on yet", not n.mover.avoiding)
+
+# Already on the line through the middle of the gap: nothing left to correct.
+gap_l = M.SIDE_WALL_AT_CENTRE_M - M.OBSTACLE_PASS_OFFSET_M
+gap_r = M.SIDE_WALL_AT_CENTRE_M + M.OBSTACLE_PASS_OFFSET_M
+n, v, s, d = ob_nav(bearing=30.0, left=gap_l, right=gap_r)
+check("obstacle on the right and already 6cm over to the left -> on target, drives straight",
+      n.mover.avoiding and steer(d) == 0)
+
+# Alongside: the obstacle-side sonar reads the obstacle at ~2cm, the far wall reads ~2cm.
+n, v, s, d = ob_nav(bearing=30.0)
+s.l = s.r = 0.02
+v.set(None)                      # the camera has lost it by now
+run(n, 3)
+check("alongside it (both sonars ~2cm) -> the two-wall centring holds it in the gap, straight on",
+      n.mover.avoiding and steer(d) == 0 and d.last[0] > 0)
+
+# Past it: the sidestep is dropped, and the usual centring pulls back to the middle.
+n, v, s, d = ob_nav(bearing=30.0)
+shift, until = n.mover.avoid
+n.mover._avoid_shift(until - 0.01)
+check("once past the obstacle (plus OBSTACLE_CLEAR_M) the sidestep ends", not n.mover.avoiding)
+
+# The front sonar sees the obstacle on the way in: that must not make it give up the cell.
+n, v, s, d = ob_nav(bearing=30.0)
+s.front = 0.15                    # the sonar now sees the obstacle (or the camera's seen it first)
+run(n, 12)
+check("sidestepping: the front sonar reading the obstacle at 15cm is not 'blocked'",
+      n.mover.phase == M.Mover.DRIVE and d.last[0] > 0)
+ahead_cell = (M.BASE_CELL[0], M.BASE_CELL[1] - 1)
+check("(setup) so far the cell ahead is still open", ahead_cell not in n.map.blocked)
+s.front = M.OBSTACLE_FRONT_STOP_M - 0.01
+run(n, 12)
+check("...but nearly touching it IS blocked: backs out rather than collide (at 6cm it reads "
+      "like a wall at the cell edge, so that is what gets recorded)",
+      ahead_cell in n.map.blocked or n.map.wall(M.BASE_CELL, 0) is True)
+
+# The same obstacle with no sidestep (dead ahead): the old behaviour, blocked and detoured.
+n, v, s, d = ob_nav(bearing=0.0)
+s.front = 0.15
+run(n, 12)
+check("obstacle dead ahead at 15cm: still declared blocked (cell marked, detoured as before)",
+      (M.BASE_CELL[0], M.BASE_CELL[1] - 1) in n.map.blocked)
+
+# Switches.
+_av = M.OBSTACLE_AVOID
+M.OBSTACLE_AVOID = False
+n, v, s, d = ob_nav(bearing=30.0)
+M.OBSTACLE_AVOID = _av
+check("OBSTACLE_AVOID = False (--no-avoid) turns it off", not n.mover.avoiding and steer(d) == 0)
+
+# A sidestep belongs to one leg: the next move starts clean.
+n, v, s, d = ob_nav(bearing=30.0)
+n.mover.move_to(*n.map.centre((M.BASE_CELL[0], M.BASE_CELL[1] - 1)), 0.0)
+check("a new move clears the old sidestep", not n.mover.avoiding)
+
+# The vision wrapper picks the obstacle out of the detections: nearest, on the floor only.
+class _Sys:                         # stands in for VisionSystem
+    def __init__(self, dets): self.dets = dets
+    def _blur_variance(self, f): return 1000.0
+    def classify_frame(self, f): return self.dets
+
+class _Cam:
+    def read(self): return _Frame()
+class _Frame:
+    shape = (480, 640, 3)
+
+def det(cls, y, h, ang, dist, ground=True):
+    return {"class": cls, "bbox": (300, y, 60, h), "angle_deg": ang, "distance_m": dist,
+            "is_ground_object": ground, "confidence": 0.8}
+
+vv = M.VictimVision.__new__(M.VictimVision)
+vv.camera, vv.system, vv._placeholder = _Cam(), None, False
+vv.frame_w = vv.frame_h = None; vv.last_frame = None; vv.last_detections = []
+vv.last_blur = None; vv.blur_rejected = False; vv.class_counts = {}
+vv.n_victim_raw = vv.n_victim_kept = vv.n_marker = 0; vv.marker = vv.obstacle = None
+floor_y = 480 // 2 + 60            # base well below the horizon (image centre row)
+vv.system = _Sys([det("obstacle", floor_y, 60, 20.0, 0.30),
+                  det("obstacle", floor_y - 40, 60, -10.0, 0.50),     # further: base higher
+                  det("obstacle", 100, 60, 5.0, None),                # base above the horizon
+                  det("ramp", floor_y, 60, 0.0, 0.2)])
+vv.look()
+check("VictimVision.obstacle: the NEAREST floor obstacle (lowest base), not a ramp, not a wall-high one",
+      vv.obstacle is not None and abs(vv.obstacle.bearing_deg - 20.0) < 1e-9
+      and abs(vv.obstacle.distance_m - 0.30) < 1e-9)
+vv.system = _Sys([det("ramp", floor_y, 60, 0.0, 0.2)])
+vv.look()
+check("...and None when there is no obstacle in view", vv.obstacle is None)
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED, M.STEER_MIN_RATE = _s38_saved
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
