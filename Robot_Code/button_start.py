@@ -12,11 +12,11 @@
     python3 button_start.py -- --test-mode      # anything after -- is passed to main.py
     ./install_button_service.sh                 # run this automatically every boot
 
-WIRING: one leg of the push button to GPIO 26 (physical pin 37), the other leg to GND
-(physical pin 39, two pins further along the same edge). No resistor needed: the Pi's
-internal pull-up holds the pin HIGH, and pressing the button shorts it to GND (LOW).
-GPIO 26 is clear of everything main.py uses -- I2C 2/3, LEDs 16/20/21, sonars 22/27,
-23/24, 5/6. If the HAT covers pin 37, any free pin works: change BUTTON_BCM below.
+WIRING: one leg of the push button to GPIO 20 (physical pin 38), the other leg to GND
+(physical pin 39, right next to it, or pin 34). No resistor needed: the Pi's internal
+pull-up holds the pin HIGH, and pressing the button shorts it to GND (LOW).
+GPIO 20 is clear of everything main.py uses -- I2C 2/3, LEDs 13/19/26, sonars 22/27,
+23/24, 5/6.
 
 Why a separate launcher instead of a loop inside main.py: main.py is a long-lived
 mission with a lot of state (the map, odometry, the camera). Starting it fresh for every
@@ -34,9 +34,9 @@ import time
 # ===========================================================================
 # CONFIG
 # ===========================================================================
-BUTTON_BCM = 26             # button between this pin and GND
-READY_LED_BCM = 20          # yellow: blips while waiting. None = no ready light
-FAULT_LED_BCM = 21          # red: flashes if main.py crashes. None = no fault light
+BUTTON_BCM = 20             # button between this pin and GND (physical pin 38)
+READY_LED_BCM = 19          # yellow (same as main.py): blips while waiting. None = off
+FAULT_LED_BCM = 26          # red (same as main.py): flashes if main.py crashes. None = off
 BOUNCE_S = 0.1              # contact bounce shorter than this is ignored
 STOP_ARM_S = 1.0            # a press this soon after starting is ignored (double-tap)
 STOP_GRACE_S = 10.0         # after "Ctrl-C", main.py gets this long to tidy up...

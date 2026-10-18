@@ -70,9 +70,11 @@ from maze import (EAST, HEADING_BY_NAME, HEADING_NAME, HEADING_RAD, LEFT_OF,  # 
 # CONFIG -- the only numbers you should need to touch
 # ===========================================================================
 
-GREEN_LED_BCM = 16          # victim detected
-YELLOW_LED_BCM = 20         # collection placeholder
-RED_LED_BCM = 21            # returning to base -- wired, not yet driven by the FSM
+# Moved 2026-10-19 from 16/20/21 to 13/19/26, freeing GPIO 20 for the start button
+# (button_start.py). Physical pins: green 33, yellow 35, red 37.
+GREEN_LED_BCM = 13          # victim detected
+YELLOW_LED_BCM = 19         # exploring / navigating
+RED_LED_BCM = 26            # returning to base with a victim
 
 # Ultrasonics: (TRIG_BCM, ECHO_BCM). Front is the primary range to the victim;
 # left/right are for walls. All reachable through the HAT's passthrough pins.
@@ -80,13 +82,14 @@ RED_LED_BCM = 21            # returning to base -- wired, not yet driven by the 
 # *** ECHO IS A 5 V OUTPUT AND PI GPIO IS 3.3 V ONLY ***
 # Wire each ECHO through a divider (1k in series, 2k to ground) or you will
 # eventually damage the pin. TRIG is an input to the sensor and is fine direct.
-# (Right was once on (20, 21) until the LEDs claimed those.)
+# (Right was once on (20, 21) until the old LED pins claimed those.)
 # The names are WHERE THE SENSOR SITS ON THE ROBOT, looking from behind it. They were once
 # crossed -- fixed 2026-10-15 after the sensors were found mixed up: the sensor at the real
 # front is on 22/27, the real left on 23/24, the real right on 5/6.
 # Full pin map -- keep these disjoint:
 #   I2C to the motor HAT   2, 3
-#   LEDs                   16 green, 20 yellow, 21 red
+#   LEDs                   13 green, 19 yellow, 26 red
+#   start button           20 (button_start.py, button to GND)
 #   ultrasonics            22/27 front, 23/24 left, 5/6 right
 ULTRASONIC_PINS = {
     "front": (22, 27),

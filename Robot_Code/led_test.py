@@ -26,9 +26,9 @@ import time
 
 # BCM numbering, matching Robot_Code/main.py
 LED_PINS = [
-    ("green",  16),   # victim detected
-    ("yellow", 20),   # searching / exploring
-    ("red",    21),   # returning to base
+    ("green",  13),   # victim detected            (physical pin 33)
+    ("yellow", 19),   # searching / exploring      (physical pin 35)
+    ("red",    26),   # returning to base          (physical pin 37)
 ]
 
 
