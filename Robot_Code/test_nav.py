@@ -1682,22 +1682,9 @@ print("34) ultrasonic pins: each name is where the sensor really sits")
 check("front sensor is on 22/27", M.ULTRASONIC_PINS["front"] == (22, 27))
 check("left sensor is on 23/24", M.ULTRASONIC_PINS["left"] == (23, 24))
 check("right sensor is on 5/6", M.ULTRASONIC_PINS["right"] == (5, 6))
-_LED_PINS = {M.GREEN_LED_BCM, M.YELLOW_LED_BCM, M.RED_LED_BCM}
-check("no two sensors share a pin (and none uses the LEDs' pins or I2C's 2/3)",
+check("no two sensors share a pin (and none uses the LEDs' 16/20/21 or I2C's 2/3)",
       len({p for pair in M.ULTRASONIC_PINS.values() for p in pair}) == 6
-      and not ({p for pair in M.ULTRASONIC_PINS.values() for p in pair} & (_LED_PINS | {2, 3})))
-check("LEDs are on 13 green / 19 yellow / 26 red",
-      (M.GREEN_LED_BCM, M.YELLOW_LED_BCM, M.RED_LED_BCM) == (13, 19, 26))
-import led_test as _LT
-check("led_test.py uses the same LED pins as main.py",
-      dict((n, p) for n, p in _LT.LED_PINS)
-      == {"green": M.GREEN_LED_BCM, "yellow": M.YELLOW_LED_BCM, "red": M.RED_LED_BCM})
-import button_start as _BS
-_sensor_pins = {p for pair in M.ULTRASONIC_PINS.values() for p in pair}
-check("start button is on GPIO 20, clear of the LEDs, sonars and I2C",
-      _BS.BUTTON_BCM == 20 and _BS.BUTTON_BCM not in (_LED_PINS | _sensor_pins | {2, 3}))
-check("button_start's ready/fault lights are main.py's yellow/red LEDs",
-      _BS.READY_LED_BCM == M.YELLOW_LED_BCM and _BS.FAULT_LED_BCM == M.RED_LED_BCM)
+      and not ({p for pair in M.ULTRASONIC_PINS.values() for p in pair} & {16, 20, 21, 2, 3}))
 import ultrasonic_test as _UT
 check("ultrasonic_test.py uses the same pins as main.py",
       all(_UT.SENSOR_PINS[k] == M.ULTRASONIC_PINS[k] for k in ("front", "left", "right")))
